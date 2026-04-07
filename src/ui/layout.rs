@@ -23,7 +23,7 @@ pub fn render_combat(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),  // Title bar with border
-            Constraint::Length(12), // Battle arena
+            Constraint::Length(16), // Battle arena
             Constraint::Length(7),  // Word tray (full width)
             Constraint::Min(26),   // Bottom: log | grid | word bar
             Constraint::Length(1), // Keybinding bar

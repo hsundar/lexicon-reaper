@@ -6,11 +6,11 @@ use ratatui::Frame;
 
 use crate::app::App;
 use crate::game::state::CombatPhase;
+use crate::generation::stage::Biome;
 
 use super::icons;
-use super::theme::theme_for_biome;
+use super::theme::{theme_for_biome, BiomeTheme};
 
-/// Render the unified battle arena showing player and enemy facing each other
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let theme = theme_for_biome(app.biome);
 
@@ -40,52 +40,39 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // Enemy path
-            Constraint::Min(6),   // Characters + animation
+            Constraint::Min(8),   // Characters + background
+            Constraint::Length(1), // Ground line with props
             Constraint::Length(1), // Names
             Constraint::Length(1), // HP bars
             Constraint::Length(1), // Stats / constraint
         ])
         .split(inner);
 
-    // --- Enemy path progression ---
     render_enemy_path(frame, chunks[0], combat);
-
-    // --- Characters facing each other with animation ---
-    render_characters(frame, chunks[1], app, combat);
-
-    // --- Names ---
-    render_names(frame, chunks[2], app, combat);
-
-    // --- HP bars side by side ---
-    render_hp_bars(frame, chunks[3], app, combat);
-
-    // --- Player stats (left) + enemy constraint (right) ---
-    render_bottom_stats(frame, chunks[4], app, combat);
+    render_scene(frame, chunks[1], app, combat, &theme);
+    render_ground_line(frame, chunks[2], app.biome, &theme);
+    render_names(frame, chunks[3], combat);
+    render_hp_bars(frame, chunks[4], app, combat);
+    render_bottom_stats(frame, chunks[5], app, combat);
 }
 
-fn render_enemy_path(
-    frame: &mut Frame,
-    area: Rect,
-    combat: &crate::game::state::CombatState,
-) {
+// ─── Enemy Path ───
+
+fn render_enemy_path(frame: &mut Frame, area: Rect, combat: &crate::game::state::CombatState) {
     let total = combat.enemies.len();
     if total <= 1 {
-        // Single enemy - just show current marker
-        let line = Line::from(vec![
-            Span::styled(
-                format!("  [{}]", icons::DIAMOND),
-                Style::default()
-                    .fg(Color::Rgb(255, 220, 80))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]);
+        let line = Line::from(vec![Span::styled(
+            format!("  [{}]", icons::DIAMOND),
+            Style::default()
+                .fg(Color::Rgb(255, 220, 80))
+                .add_modifier(Modifier::BOLD),
+        )]);
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
 
     let current = combat.current_enemy_idx;
     let mut spans: Vec<Span> = vec![Span::raw("  ")];
-
     for i in 0..total {
         let is_current = i == current;
         let is_defeated = i < current;
@@ -100,51 +87,49 @@ fn render_enemy_path(
         } else {
             ("[ ]".to_string(), Color::Rgb(100, 100, 120))
         };
-
         spans.push(Span::styled(
             node,
-            Style::default()
-                .fg(color)
-                .add_modifier(if is_current {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                }),
+            Style::default().fg(color).add_modifier(if is_current {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
         ));
-
         if i < total - 1 {
-            let conn_color = if is_defeated {
+            let cc = if is_defeated {
                 Color::Rgb(60, 120, 60)
             } else {
                 Color::Rgb(60, 60, 80)
             };
-            spans.push(Span::styled("───", Style::default().fg(conn_color)));
+            spans.push(Span::styled("───", Style::default().fg(cc)));
         }
     }
-
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_characters(
+// ─── Scene: Background + Characters + Animation ───
+
+fn render_scene(
     frame: &mut Frame,
     area: Rect,
     app: &App,
     combat: &crate::game::state::CombatState,
+    theme: &BiomeTheme,
 ) {
-    let enemy = combat.current_enemy();
-    let theme = theme_for_biome(app.biome);
+    // 1) Render biome background across the full area
+    render_background(frame, area, app.biome, theme);
 
-    // Split area into: player (left) | gap (center) | enemy (right)
+    // 2) Split into player | gap | enemy and overlay characters
     let char_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(30), // Player
-            Constraint::Percentage(40), // Gap / animation
-            Constraint::Percentage(30), // Enemy
+            Constraint::Percentage(30),
+            Constraint::Percentage(40),
+            Constraint::Percentage(30),
         ])
         .split(area);
 
-    // --- Player character ---
+    // Player character
     let player_art = get_player_pose(&combat.phase);
     let player_color = match &combat.phase {
         CombatPhase::EnemyHitAnim { dodged: true, .. } => Color::Rgb(100, 255, 100),
@@ -152,41 +137,203 @@ fn render_characters(
         CombatPhase::PlayerAttackAnim { .. } => Color::Rgb(255, 220, 100),
         _ => Color::Rgb(150, 200, 255),
     };
-    let player_paragraph =
-        Paragraph::new(player_art).style(Style::default().fg(player_color)).alignment(Alignment::Center);
-    frame.render_widget(player_paragraph, char_chunks[0]);
+    frame.render_widget(
+        Paragraph::new(player_art)
+            .style(Style::default().fg(player_color))
+            .alignment(Alignment::Center),
+        char_chunks[0],
+    );
 
-    // --- Animation gap ---
+    // Animation gap
     render_animation_gap(frame, char_chunks[1], combat);
 
-    // --- Enemy character ---
-    let enemy_art = get_enemy_art(&enemy.sprite_key);
+    // Enemy character
+    let enemy = combat.current_enemy();
     let enemy_color = if enemy.is_boss {
         Color::Rgb(255, 80, 80)
     } else {
         theme.enemy_art
     };
-
-    // Flash enemy during hit
     let enemy_display_color = match &combat.phase {
-        CombatPhase::PlayerAttackAnim {
-            ticks_remaining, ..
-        } if *ticks_remaining < 5 => Color::Rgb(255, 255, 200), // Flash white when hit
-        CombatPhase::EnemyDefeated { .. } => Color::Rgb(100, 100, 100), // Gray when dead
+        CombatPhase::PlayerAttackAnim { ticks_remaining, .. } if *ticks_remaining < 5 => {
+            Color::Rgb(255, 255, 200)
+        }
+        CombatPhase::EnemyDefeated { .. } => Color::Rgb(100, 100, 100),
         _ => enemy_color,
     };
-
-    let enemy_paragraph = Paragraph::new(enemy_art)
-        .style(Style::default().fg(enemy_display_color))
-        .alignment(Alignment::Center);
-    frame.render_widget(enemy_paragraph, char_chunks[2]);
+    let enemy_art = get_enemy_art(&enemy.sprite_key);
+    frame.render_widget(
+        Paragraph::new(enemy_art)
+            .style(Style::default().fg(enemy_display_color))
+            .alignment(Alignment::Center),
+        char_chunks[2],
+    );
 }
 
-fn render_animation_gap(
-    frame: &mut Frame,
-    area: Rect,
-    combat: &crate::game::state::CombatState,
-) {
+fn render_background(frame: &mut Frame, area: Rect, biome: Biome, theme: &BiomeTheme) {
+    let w = area.width as usize;
+    let h = area.height as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+
+    let bg_lines = get_biome_background(biome, w, h);
+    let sky_style = Style::default().fg(theme.sky);
+
+    for (i, line_str) in bg_lines.iter().enumerate() {
+        if i >= h {
+            break;
+        }
+        let y = area.y + i as u16;
+        let rect = Rect::new(area.x, y, area.width, 1);
+
+        // Color elements differently
+        let colored_line = colorize_bg_line(line_str, biome, theme);
+        frame.render_widget(Paragraph::new(Line::from(colored_line)), rect);
+    }
+}
+
+fn get_biome_background(biome: Biome, w: usize, h: usize) -> Vec<String> {
+    // All background uses only ASCII characters for reliable alignment
+    let mut lines = Vec::with_capacity(h);
+
+    match biome {
+        Biome::Forest => {
+            for row in 0..h {
+                let line = match row {
+                    0 => format_bg_line(w, &[" ,  ", "   .", "  , ", "    ", "  . ", " ,  ", "    "]),
+                    1 => format_bg_line(w, &[" /\\  ", "    ", "   ", " /\\ ", "    ", "    ", "   "]),
+                    2 => format_bg_line(w, &["/||\\ ", "   ", "   ", "/||\\ ", "   ", "    ", "  "]),
+                    3 => format_bg_line(w, &[" || ", "   ", " * ", " || ", "   ", " ,, ", "  "]),
+                    4 => format_bg_line(w, &[" || ", "   ", "   ", " || ", "   ", "    ", "  "]),
+                    5 => format_bg_line(w, &[" || ", "   ", "   ", " || ", "   ", "    ", "  "]),
+                    6 => format_bg_line(w, &[" || ", " . ", " . ", " || ", " . ", " .  ", "  "]),
+                    _ => format_bg_line(w, &[" .  ", "    ", " .  ", "    ", " .  ", "    ", " . "]),
+                };
+                lines.push(line);
+            }
+        }
+        Biome::Crypt => {
+            for row in 0..h {
+                let line = match row {
+                    0 => format_bg_line(w, &["####", "    ", " i  ", "####", "    ", " i  ", "###"]),
+                    1 => format_bg_line(w, &["|  |", "  \\/", "    ", "|  |", " \\/ ", "    ", "|  "]),
+                    2 => format_bg_line(w, &["|  |", "    ", "    ", "|  |", "    ", "    ", "|  "]),
+                    3 => format_bg_line(w, &["|  |", "    ", " *  ", "|  |", "    ", "    ", "|  "]),
+                    4 => format_bg_line(w, &["|  |", "    ", "    ", "|  |", "    ", " d  ", "|  "]),
+                    5 => format_bg_line(w, &["|  |", " -+-", "    ", "|  |", "  -+", "    ", "|  "]),
+                    6 => format_bg_line(w, &["|  |", " -+-", "    ", "|  |", "  -+", "    ", "|  "]),
+                    _ => format_bg_line(w, &["####", "    ", "  . ", "####", "    ", " .  ", "###"]),
+                };
+                lines.push(line);
+            }
+        }
+        Biome::Volcano => {
+            for row in 0..h {
+                let line = match row {
+                    0 => format_bg_line(w, &["  .*", "  . ", " *  ", "  . ", " .* ", "    ", " *  "]),
+                    1 => format_bg_line(w, &["    ", " *  ", "    ", "  * ", "    ", " *  ", "    "]),
+                    2 => format_bg_line(w, &["    ", "    ", " ^^ ", "    ", "    ", "    ", " ^^ "]),
+                    3 => format_bg_line(w, &["  /\\ ", "    ", "    ", " /\\/\\", "    ", "    ", "    "]),
+                    4 => format_bg_line(w, &[" /\\/\\", "    ", " *  ", "/\\/\\/", "    ", "    ", " /\\ "]),
+                    5 => format_bg_line(w, &["/\\/\\/", " ~~ ", "    ", "/\\/\\/", "  ~~", "    ", "/\\/\\/"]),
+                    6 => format_bg_line(w, &["~~~~", "~~~~", "    ", "~~~~", "~~~~", "    ", "~~~~"]),
+                    _ => format_bg_line(w, &[" ~  ", "  ~ ", "    ", " ~  ", "  ~ ", "    ", " ~  "]),
+                };
+                lines.push(line);
+            }
+        }
+        Biome::Abyss => {
+            for row in 0..h {
+                let line = match row {
+                    0 => format_bg_line(w, &["   *", "  . ", "    ", " *  ", "   .", "    ", "  * "]),
+                    1 => format_bg_line(w, &[" .  ", "    ", " *  ", "    ", " .  ", "  * ", "    "]),
+                    2 => format_bg_line(w, &["    ", " <>  ", "    ", "    ", "  <> ", "    ", "    "]),
+                    3 => format_bg_line(w, &["  : ", "    ", "  * ", "  : ", "    ", "    ", " :  "]),
+                    4 => format_bg_line(w, &["  | ", "    ", "    ", "  | ", "    ", " <> ", "  | "]),
+                    5 => format_bg_line(w, &["  | ", " .  ", "    ", "  | ", "  . ", "    ", "  | "]),
+                    6 => format_bg_line(w, &["  : ", "    ", "  . ", "  : ", "    ", " .  ", "  : "]),
+                    _ => format_bg_line(w, &["  . ", " .  ", "    ", "  . ", " .  ", "    ", "  . "]),
+                };
+                lines.push(line);
+            }
+        }
+        Biome::Void => {
+            for row in 0..h {
+                let line = match row {
+                    0 => format_bg_line(w, &["  + ", "    ", "  . ", "    ", " +  ", "    ", "  . "]),
+                    1 => format_bg_line(w, &["    ", " .  ", "    ", " +  ", "    ", " .  ", "    "]),
+                    2 => format_bg_line(w, &[" :: ", "    ", "    ", "  ::", "    ", "    ", " :: "]),
+                    3 => format_bg_line(w, &["    ", " @  ", "    ", "    ", "  @ ", "    ", "    "]),
+                    4 => format_bg_line(w, &[" .  ", "    ", " :: ", "  . ", "    ", " :: ", "    "]),
+                    5 => format_bg_line(w, &["    ", "  . ", "    ", " .  ", "    ", "  . ", "    "]),
+                    6 => format_bg_line(w, &["  ::", "    ", " .  ", "  ::", "    ", " .  ", "  ::"]),
+                    _ => format_bg_line(w, &[" .  ", "    ", "    ", " .  ", "    ", "    ", " .  "]),
+                };
+                lines.push(line);
+            }
+        }
+    }
+
+    while lines.len() < h {
+        lines.push(" ".repeat(w));
+    }
+    lines
+}
+
+fn format_bg_line(width: usize, segments: &[&str]) -> String {
+    let mut line = String::new();
+    let mut idx = 0;
+    while line.len() < width {
+        line.push_str(segments[idx % segments.len()]);
+        idx += 1;
+    }
+    line.truncate(width);
+    line
+}
+
+fn colorize_bg_line<'a>(line: &'a str, biome: Biome, theme: &BiomeTheme) -> Vec<Span<'a>> {
+    // Render the entire line dimly in the biome's sky color
+    // Special chars get slightly brighter prop colors
+    let dim_style = Style::default().fg(theme.sky);
+    vec![Span::styled(line, dim_style)]
+}
+
+// ─── Ground Line ───
+
+fn render_ground_line(frame: &mut Frame, area: Rect, biome: Biome, theme: &BiomeTheme) {
+    let w = area.width as usize;
+    let pattern = match biome {
+        Biome::Forest => "==,==.==w==.==*==.==,==.==w==.=",
+        Biome::Crypt => "##i##-##d##-##*##-##i##-##d##-#",
+        Biome::Volcano => "~~^^/\\~~/\\~~*~~~/\\^^~~^^/\\~~^^~",
+        Biome::Abyss => "--<>--.--:--.-*--.--<>--.--:--.",
+        Biome::Void => "::+::.::@::.::*::.::+::.::@::.",
+    };
+
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut spans: Vec<Span> = Vec::new();
+    for i in 0..w {
+        let ch = chars[i % chars.len()];
+        let color = match ch {
+            '*' => Color::Rgb(80, 200, 255),
+            'w' | ',' => theme.prop2,
+            '^' | '~' => theme.prop1,
+            'i' | 'd' => theme.prop1,
+            ':' | '<' | '>' | '@' | '+' => theme.prop2,
+            '#' | '=' => theme.ground,
+            '-' | '/' | '\\' => theme.ground,
+            _ => theme.ground,
+        };
+        spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+// ─── Animation Gap ───
+
+fn render_animation_gap(frame: &mut Frame, area: Rect, combat: &crate::game::state::CombatState) {
     let mid_y = area.y + area.height / 2;
     let gap_rect = Rect::new(area.x, mid_y, area.width, 1);
 
@@ -200,42 +347,31 @@ fn render_animation_gap(
             let progress = 10u8.saturating_sub(*ticks_remaining);
             let total_width = area.width as usize;
             let pos = (progress as usize * total_width / 10).min(total_width.saturating_sub(1));
-
-            let mut line_chars = " ".repeat(total_width);
-            if pos < total_width {
-                // Build slash trail
-                let slash = "───⚔►";
-                let slash_len = 5;
-                let start = pos.saturating_sub(slash_len);
-                let mut chars: Vec<char> = line_chars.chars().collect();
-                for (i, ch) in slash.chars().enumerate() {
-                    let idx = start + i;
-                    if idx < total_width {
-                        chars[idx] = ch;
-                    }
+            let mut chars: Vec<char> = " ".repeat(total_width).chars().collect();
+            let slash = "───⚔►";
+            let slash_len = 5;
+            let start = pos.saturating_sub(slash_len);
+            for (i, ch) in slash.chars().enumerate() {
+                let idx = start + i;
+                if idx < total_width {
+                    chars[idx] = ch;
                 }
-                line_chars = chars.into_iter().collect();
             }
-
+            let line_chars: String = chars.into_iter().collect();
             let color = if *is_crit {
                 Color::Rgb(255, 255, 80)
             } else {
                 Color::Rgb(255, 180, 80)
             };
-
             frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    line_chars,
-                    Style::default().fg(color),
-                ))),
+                Paragraph::new(Line::from(Span::styled(line_chars, Style::default().fg(color)))),
                 gap_rect,
             );
-
-            // Damage number floating above
+            // Floating damage
             if *ticks_remaining < 6 {
                 let dmg_y = mid_y.saturating_sub(1 + (6 - *ticks_remaining) as u16 / 2);
                 let dmg_x = area.x + area.width * 3 / 4;
-                if dmg_y >= area.y && dmg_x + 6 <= area.x + area.width {
+                if dmg_y >= area.y && dmg_x + 8 <= area.x + area.width {
                     let dmg_rect = Rect::new(dmg_x, dmg_y, 8, 1);
                     let dmg_text = if *is_crit {
                         format!("-{} !!!", damage)
@@ -250,33 +386,27 @@ fn render_animation_gap(
                     frame.render_widget(
                         Paragraph::new(Line::from(Span::styled(
                             dmg_text,
-                            Style::default()
-                                .fg(dmg_color)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(dmg_color).add_modifier(Modifier::BOLD),
                         ))),
                         dmg_rect,
                     );
                 }
             }
         }
-        CombatPhase::EnemyTurn { ticks_remaining } | CombatPhase::EnemyHitAnim { ticks_remaining, .. } => {
+        CombatPhase::EnemyTurn { ticks_remaining }
+        | CombatPhase::EnemyHitAnim { ticks_remaining, .. } => {
             let progress = 8u8.saturating_sub(*ticks_remaining);
             let total_width = area.width as usize;
             let pos = total_width.saturating_sub(progress as usize * total_width / 8);
-
-            let mut line_chars = " ".repeat(total_width);
-            if pos < total_width {
-                let slash = "◄⚔───";
-                let mut chars: Vec<char> = line_chars.chars().collect();
-                for (i, ch) in slash.chars().enumerate() {
-                    let idx = pos + i;
-                    if idx < total_width {
-                        chars[idx] = ch;
-                    }
+            let mut chars: Vec<char> = " ".repeat(total_width).chars().collect();
+            let slash = "◄⚔───";
+            for (i, ch) in slash.chars().enumerate() {
+                let idx = pos + i;
+                if idx < total_width {
+                    chars[idx] = ch;
                 }
-                line_chars = chars.into_iter().collect();
             }
-
+            let line_chars: String = chars.into_iter().collect();
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     line_chars,
@@ -286,12 +416,11 @@ fn render_animation_gap(
             );
         }
         CombatPhase::Walking { ticks_remaining } => {
-            // Walking dots animation
             let dots = match ticks_remaining % 4 {
-                0 => "   >>>   ",
-                1 => "    >>>  ",
-                2 => "     >>> ",
-                _ => "  >>>    ",
+                0 => "  >>>  ",
+                1 => "   >>> ",
+                2 => "    >>>",
+                _ => " >>>   ",
             };
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
@@ -303,11 +432,7 @@ fn render_animation_gap(
             );
         }
         CombatPhase::EnemyDefeated { ticks_remaining } => {
-            let text = if *ticks_remaining > 8 {
-                "   DEFEATED!   "
-            } else {
-                ""
-            };
+            let text = if *ticks_remaining > 8 { "DEFEATED!" } else { "" };
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     format!("{:^w$}", text, w = area.width as usize),
@@ -323,22 +448,18 @@ fn render_animation_gap(
     }
 }
 
-fn render_names(
-    frame: &mut Frame,
-    area: Rect,
-    _app: &App,
-    combat: &crate::game::state::CombatState,
-) {
+// ─── Names, HP, Stats ───
+
+fn render_names(frame: &mut Frame, area: Rect, combat: &crate::game::state::CombatState) {
     let enemy = combat.current_enemy();
     let halves = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
-    // Player name
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "  Grimm",
+            "  Grimm the Reaper",
             Style::default()
                 .fg(Color::Rgb(150, 200, 255))
                 .add_modifier(Modifier::BOLD),
@@ -346,7 +467,6 @@ fn render_names(
         halves[0],
     );
 
-    // Enemy name
     let name_style = if enemy.is_boss {
         Style::default()
             .fg(Color::Rgb(255, 80, 80))
@@ -371,98 +491,69 @@ fn render_names(
     );
 }
 
-fn render_hp_bars(
-    frame: &mut Frame,
-    area: Rect,
-    app: &App,
-    combat: &crate::game::state::CombatState,
-) {
+fn render_hp_bars(frame: &mut Frame, area: Rect, app: &App, combat: &crate::game::state::CombatState) {
     let enemy = combat.current_enemy();
     let player = &app.player;
-
     let halves = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Percentage(48),
-            Constraint::Length(4), // gap
+            Constraint::Length(4),
             Constraint::Percentage(48),
         ])
         .split(area);
 
-    // Player HP
     let p_ratio = player.hp as f64 / player.max_hp as f64;
     let p_color = hp_color(p_ratio);
-    let p_gauge = Gauge::default()
-        .gauge_style(Style::default().fg(p_color).bg(Color::Rgb(40, 40, 50)))
-        .ratio(p_ratio.clamp(0.0, 1.0))
-        .label(format!("{} {}/{}", icons::HEART, player.hp, player.max_hp));
-    frame.render_widget(p_gauge, halves[0]);
+    frame.render_widget(
+        Gauge::default()
+            .gauge_style(Style::default().fg(p_color).bg(Color::Rgb(40, 40, 50)))
+            .ratio(p_ratio.clamp(0.0, 1.0))
+            .label(format!("{} {}/{}", icons::HEART, player.hp, player.max_hp)),
+        halves[0],
+    );
 
-    // Enemy HP
     let e_ratio = enemy.hp as f64 / enemy.max_hp as f64;
     let e_color = hp_color(e_ratio);
-    let e_gauge = Gauge::default()
-        .gauge_style(Style::default().fg(e_color).bg(Color::Rgb(40, 40, 50)))
-        .ratio(e_ratio.clamp(0.0, 1.0))
-        .label(format!("{} {}/{}", icons::HEART, enemy.hp, enemy.max_hp));
-    frame.render_widget(e_gauge, halves[2]);
+    frame.render_widget(
+        Gauge::default()
+            .gauge_style(Style::default().fg(e_color).bg(Color::Rgb(40, 40, 50)))
+            .ratio(e_ratio.clamp(0.0, 1.0))
+            .label(format!("{} {}/{}", icons::HEART, enemy.hp, enemy.max_hp)),
+        halves[2],
+    );
 }
 
-fn render_bottom_stats(
-    frame: &mut Frame,
-    area: Rect,
-    app: &App,
-    combat: &crate::game::state::CombatState,
-) {
+fn render_bottom_stats(frame: &mut Frame, area: Rect, app: &App, combat: &crate::game::state::CombatState) {
     let enemy = combat.current_enemy();
     let player = &app.player;
-
     let halves = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
-    // Player compact stats
     let stats = Line::from(vec![
         Span::styled(format!("  {} ", icons::SWORD), Style::default().fg(Color::Rgb(255, 120, 80))),
-        Span::styled(
-            format!("{}", player.base_attack),
-            Style::default().fg(Color::White),
-        ),
+        Span::styled(format!("{}", player.base_attack), Style::default().fg(Color::White)),
         Span::styled(format!(" {} ", icons::SHIELD), Style::default().fg(Color::Rgb(120, 160, 255))),
-        Span::styled(
-            format!("{}", player.armor),
-            Style::default().fg(Color::White),
-        ),
+        Span::styled(format!("{}", player.armor), Style::default().fg(Color::White)),
         Span::styled(format!(" {} ", icons::BOLT), Style::default().fg(Color::Rgb(255, 220, 80))),
-        Span::styled(
-            format!("{}%", (player.crit_chance * 100.0) as i32),
-            Style::default().fg(Color::White),
-        ),
+        Span::styled(format!("{}%", (player.crit_chance * 100.0) as i32), Style::default().fg(Color::White)),
         Span::styled(format!(" {} ", icons::DIAMOND), Style::default().fg(Color::Rgb(255, 215, 0))),
-        Span::styled(
-            format!("{}", player.gems),
-            Style::default().fg(Color::Rgb(255, 230, 100)),
-        ),
+        Span::styled(format!("{}", player.gems), Style::default().fg(Color::Rgb(255, 230, 100))),
     ]);
     frame.render_widget(Paragraph::new(stats), halves[0]);
 
-    // Enemy constraint (right)
     if let Some(constraint) = &enemy.word_constraint {
-        let line = Line::from(vec![
-            Span::styled(
-                format!("{} ", icons::WARNING),
-                Style::default().fg(Color::Rgb(255, 200, 50)),
-            ),
-            Span::styled(
-                constraint.description(),
-                Style::default()
-                    .fg(Color::Rgb(255, 200, 50))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]);
         frame.render_widget(
-            Paragraph::new(line).alignment(Alignment::Right),
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("{} ", icons::WARNING), Style::default().fg(Color::Rgb(255, 200, 50))),
+                Span::styled(
+                    constraint.description(),
+                    Style::default().fg(Color::Rgb(255, 200, 50)).add_modifier(Modifier::BOLD),
+                ),
+            ]))
+            .alignment(Alignment::Right),
             halves[1],
         );
     }
@@ -478,126 +569,207 @@ fn hp_color(ratio: f64) -> Color {
     }
 }
 
+// ─── Player Character Art (8 lines) ───
+
+fn dedent(s: &str) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    let min_indent = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    lines
+        .iter()
+        .map(|l| {
+            if l.len() >= min_indent {
+                &l[min_indent..]
+            } else {
+                l.trim()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn get_player_pose(phase: &CombatPhase) -> String {
-    match phase {
+    // All art uses only ASCII + basic box-drawing (single-width chars)
+    // Each line is padded to exactly 14 chars for consistent alignment
+    let art = match phase {
         CombatPhase::PlayerAttackAnim { ticks_remaining, .. } if *ticks_remaining > 5 => {
-            // Attack pose - scythe swung forward
-            r#"    /\
-   /||\──⌇
-  / ||
- /  |
-/  / \"#
-                .to_string()
+            concat!(
+                "    .---.     \n",
+                "    |o o|     \n",
+                "    '---'     \n",
+                "  .--+--.--.  \n",
+                "  | /\\  |  |-+\n",
+                "  |/  \\ |  | |\n",
+                "  '-/--\\-'  | \n",
+                "   /    \\   + \n",
+            )
         }
-        CombatPhase::EnemyHitAnim {
-            dodged: true, ..
-        } => {
-            // Dodge pose - leaning back
-            r#"      /\
-     /||\
-      ||  \
-      || /
-     /  \"#
-                .to_string()
+        CombatPhase::EnemyHitAnim { dodged: true, .. } => {
+            concat!(
+                "      .---.   \n",
+                "      |o o|   \n",
+                "      '---'   \n",
+                "    .--+--.   \n",
+                "    | /\\  |+  \n",
+                "     \\/  \\/ | \n",
+                "      \\--/  | \n",
+                "       \\/   + \n",
+            )
         }
-        CombatPhase::EnemyHitAnim {
-            dodged: false, ..
-        } => {
-            // Hit pose - recoiling
-            r#"  /\
-  /||\
-  /|| \
-   ||
-  /  \"#
-                .to_string()
+        CombatPhase::EnemyHitAnim { dodged: false, .. } => {
+            concat!(
+                "  .---.       \n",
+                "  |x x|       \n",
+                "  '---'       \n",
+                " .--+--.      \n",
+                " | ><>< | +   \n",
+                " |  \\/  | |   \n",
+                " '--/\\--' |   \n",
+                "   /  \\   +   \n",
+            )
         }
         CombatPhase::Walking { ticks_remaining } => {
-            // Walk animation - alternate frames
             if ticks_remaining % 4 < 2 {
-                r#"   /\
-  /||\
-  /||\
-  / |
- /   \"#
-                    .to_string()
+                concat!(
+                    "    .---.     \n",
+                    "    |o o|     \n",
+                    "    '---'     \n",
+                    "  .--+--.  +  \n",
+                    "  | /\\  |  |  \n",
+                    "  |/  \\ |  |  \n",
+                    "  '-/--\\-' +  \n",
+                    "   /   \\      \n",
+                )
             } else {
-                r#"   /\
-  /||\
-  /||\
-   | \
-  /   \"#
-                    .to_string()
+                concat!(
+                    "    .---.     \n",
+                    "    |o o|     \n",
+                    "    '---'     \n",
+                    "  .--+--.  +  \n",
+                    "  | /\\  |  |  \n",
+                    "  |/  \\ |  |  \n",
+                    "  '-/--\\-' +  \n",
+                    "    \\  /      \n",
+                )
             }
         }
         _ => {
-            // Idle pose - standing with scythe
-            r#"   /\
-  /||\
-  /||\⌇
-  /  \
- /    \"#
-                .to_string()
+            // Idle - reaper with scythe
+            concat!(
+                "    .---.     \n",
+                "    |o o|     \n",
+                "    '---'     \n",
+                "  .--+--.     \n",
+                "  | /\\  |  +  \n",
+                "  |/  \\ |  |  \n",
+                "  '-/--\\-' |  \n",
+                "   /    \\  +  \n",
+            )
         }
-    }
+    };
+    art.trim_end().to_string()
 }
 
+// ─── Enemy Art (8 lines) ───
+
 fn get_enemy_art(sprite_key: &str) -> String {
-    match sprite_key {
-        "goblin" => r#"  /\_/\
- ( o.o )
- (> ^ <)
-  /| |\
- (_| |_)"#
-            .to_string(),
-        "skeleton" => r#"   _☠_
-  /o.o\
-  |=+=|
-  /| |\
- (_/ \_)"#
-            .to_string(),
-        "wolf" => r#" /\    /\
-/  \../  \
-( ◉    ◉ )
- \  <>  /
-  '----'"#
-            .to_string(),
-        "slime" => r#"  .-""-.
- / o  o \
-|   __   |
- \ \__/ /
-  '-..-'"#
-            .to_string(),
-        "boss_goblin" => r#" ♛___/\___
- / ◉    ◉ \
-(  >>==<<  )
- \_|_/\_|_/
-   |    |
-  /|    |\"#
-            .to_string(),
-        "boss_skeleton" => r#" ♛  _☠☠_
-   /◉  ◉\
-  |==++=+|
-   \_||_/
-   /|  |\
-  (_/  \_)"#
-            .to_string(),
-        "boss_wolf" => r#" ♛/\     /\
-  /  \=*=/  \
- ( ◉◉   ◉◉ )
-  \  <▽▽>  /
-   '-=====-'"#
-            .to_string(),
-        "boss_slime" => r#" ♛.-""""-.
-  / ◉   ◉ \
- |  /‾‾‾\  |
- |  \___/  |
-  \________/"#
-            .to_string(),
-        _ => r#"  ??????
-  ?    ?
-  ?    ?
-  ??????
-  ? ?? ?"#
-            .to_string(),
-    }
+    // All art uses only ASCII + basic box-drawing
+    // Each line padded to consistent width per sprite
+    let art = match sprite_key {
+        "goblin" => concat!(
+            "    /\\\n",
+            "   /oo\\\n",
+            "   \\></ \n",
+            "    \\/  \n",
+            "  .----.  \n",
+            "  | /\\ |  \n",
+            "  '-/\\-'  \n",
+            "   /  \\   \n",
+        ),
+        "skeleton" => concat!(
+            "   .==.   \n",
+            "   |oo|   \n",
+            "   '--'   \n",
+            "  .=||=.  \n",
+            "  |=||=|  \n",
+            "  | || |== \n",
+            "  '=/\\='  \n",
+            "   /  \\   \n",
+        ),
+        "wolf" => concat!(
+            "  /\\    /\\  \n",
+            " /  \\--/  \\ \n",
+            " | o    o | \n",
+            " \\  <-->  / \n",
+            "  '------'  \n",
+            "   |/\\/\\|   \n",
+            "   | |  ||  \n",
+            "   '-'  ''  \n",
+        ),
+        "slime" => concat!(
+            "  .-------. \n",
+            " / o     o \\\n",
+            " |  .---.  |\n",
+            " |  '---'  |\n",
+            " |  *   o  |\n",
+            " \\  .---.  /\n",
+            "  '-------' \n",
+            "  ~~~~~~~~~~ \n",
+        ),
+        "boss_goblin" => concat!(
+            "  W  /\\  W  \n",
+            "    /oooo\\  \n",
+            "    \\>>>>/  \n",
+            " .--'----'-.\n",
+            " | /\\/\\/\\ | \n",
+            " |/  \\/  \\| \n",
+            " '-/------\\'\n",
+            "  //      \\\\\n",
+        ),
+        "boss_skeleton" => concat!(
+            "  W .====. W\n",
+            "    |oooo|  \n",
+            "    '----'  \n",
+            " .==+====+==.\n",
+            " |==|====|==|\n",
+            " |  | || |  |==\n",
+            " '==/\\/\\==' \n",
+            "  //      \\\\\n",
+        ),
+        "boss_wolf" => concat!(
+            " W/\\  W  /\\W\n",
+            " /  \\--/  \\ \n",
+            " |oo    oo| \n",
+            " \\  <===>  /\n",
+            " .--------. \n",
+            " | /\\/\\/\\ | \n",
+            " |//      \\|\n",
+            " '/        '\n",
+        ),
+        "boss_slime" => concat!(
+            " W.---------.W\n",
+            " / oo    oo   \\\n",
+            " |  .------.  |\n",
+            " |  '------'  |\n",
+            " | ** oo ** oo|\n",
+            " |  .------.  |\n",
+            " '------------'\n",
+            " ~~~~~~~~~~~~~~\n",
+        ),
+        _ => concat!(
+            "  .-----. \n",
+            "  | ??? | \n",
+            "  | ??? | \n",
+            "  '-----' \n",
+            "  | ??? | \n",
+            "  | ??? | \n",
+            "  '-----' \n",
+            "    ???    \n",
+        ),
+    };
+    art.trim_end().to_string()
 }
